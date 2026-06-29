@@ -4,8 +4,9 @@ pipeline.py — VibeSync LangChain LCEL Backend
 
 This module contains:
   1. mock_tone_analysis()   — stub that randomly returns a tone label
-  2. build_vibesync_chain() — LCEL chain: PromptTemplate | LLM | StrOutputParser
-  3. rephrase_with_vibe()   — single entry-point used by app.py
+  2. get_llm()              — smart LLM selector: tries Gemini first, falls back to Groq
+  3. build_vibesync_chain() — LCEL chain: PromptTemplate | LLM | StrOutputParser
+  4. rephrase_with_vibe()   — single entry-point used by app.py
 
 HOW THE LCEL PIPELINE WORKS
 ────────────────────────────
@@ -13,15 +14,17 @@ LangChain Expression Language (LCEL) lets you compose pipeline steps with the
 pipe operator (|).  Each step is a Runnable, and output of one step becomes the
 input of the next.
 
-    PromptTemplate  →  ChatGoogleGenerativeAI  →  StrOutputParser
-         (1)                    (2)                      (3)
+    PromptTemplate  →  LLM (Gemini or Groq)  →  StrOutputParser
+         (1)                   (2)                      (3)
 
 Step 1 – PromptTemplate:
-  Accepts a dict  {"transcribed_text": ..., "detected_tone": ...}
+  Accepts a dict  {"transcribed_text": ..., "detected_tone": ..., "emojis": ...}
   and renders a fully-formed prompt string that instructs the LLM.
 
-Step 2 – ChatGoogleGenerativeAI (gemini-2.5-flash):
-  Receives the rendered prompt, calls the Gemini API, returns an AIMessage.
+Step 2 – LLM (with automatic fallback):
+  PRIMARY  → ChatGoogleGenerativeAI (gemini-2.5-flash)  if GOOGLE_API_KEY is set
+  FALLBACK → ChatGroq (llama-3.1-8b-instant)            if GROQ_API_KEY is set
+  The fallback kicks in automatically when Gemini is unavailable or its key is missing.
 
 Step 3 – StrOutputParser:
   Unwraps the AIMessage and returns a plain Python string — the final output.
@@ -29,14 +32,16 @@ Step 3 – StrOutputParser:
 
 import os
 import random
+import logging
 from dotenv import load_dotenv
 
 # LangChain imports
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_google_genai import ChatGoogleGenerativeAI
 
-load_dotenv()  # reads GOOGLE_API_KEY from .env
+load_dotenv()  # reads GOOGLE_API_KEY and GROQ_API_KEY from .env
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,108 +81,167 @@ def mock_tone_analysis(audio_path: str | None = None) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  LCEL CHAIN BUILDER
+# 2.  SMART LLM SELECTOR  (Gemini primary → Groq fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# The prompt template uses two input variables:
+def get_llm(temperature: float = 0.8):
+    """
+    Returns the best available LLM using this priority order:
+
+      1. Gemini 2.5 Flash  — if GOOGLE_API_KEY is present and valid
+      2. Groq llama-3.1-8b — if GROQ_API_KEY is present (automatic fallback)
+      3. Raises RuntimeError if neither key is available
+
+    Both LLMs implement the same LangChain BaseChatModel interface, so
+    the LCEL chain works identically regardless of which one is selected.
+
+    Args:
+        temperature: Sampling temperature (0.0 = deterministic, 1.0 = creative).
+
+    Returns:
+        Tuple[BaseChatModel, str]: (llm_instance, human_readable_name)
+
+    Raises:
+        RuntimeError: When no API key is configured.
+    """
+    google_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    groq_key   = os.getenv("GROQ_API_KEY",   "").strip()
+
+    # ── PRIMARY: Google Gemini ────────────────────────────────────────────────
+    if google_key and google_key != "your_google_api_key_here":
+        try:
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            llm = ChatGoogleGenerativeAI(
+                model="gemini-2.5-flash",
+                temperature=temperature,
+                google_api_key=google_key,
+            )
+            logger.info("LLM selected: Gemini 2.5 Flash (primary)")
+            return llm, "Gemini 2.5 Flash"
+        except Exception as e:
+            logger.warning("Gemini init failed (%s) — trying Groq fallback.", e)
+
+    # ── FALLBACK: Groq ────────────────────────────────────────────────────────
+    if groq_key and groq_key != "your_groq_api_key_here":
+        try:
+            from langchain_groq import ChatGroq
+            llm = ChatGroq(
+                model="llama-3.1-8b-instant",   # fast & free-tier friendly
+                temperature=temperature,
+                groq_api_key=groq_key,
+            )
+            logger.info("LLM selected: Groq llama-3.1-8b-instant (fallback)")
+            return llm, "Groq llama-3.1-8b-instant"
+        except Exception as e:
+            logger.warning("Groq init failed (%s).", e)
+
+    raise RuntimeError(
+        "No LLM available. Set GOOGLE_API_KEY (Gemini) or GROQ_API_KEY (Groq) in your .env file."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  LCEL CHAIN BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The prompt template receives three variables injected by rephrase_with_vibe():
 #   {transcribed_text} — raw transcript from Whisper
 #   {detected_tone}    — tone label from mock_tone_analysis()
-#   {emojis}           — resolved from TONE_EMOJI_MAP inside rephrase_with_vibe()
+#   {emojis}           — resolved from TONE_EMOJI_MAP
 VIBESYNC_PROMPT_TEMPLATE = """
-You are VibeSync, an expressive communication assistant.
+You are VibeSync, a subtle tone-enhancement assistant.
 
-The user spoke a voice message that was transcribed. You must rephrase the
-message so it perfectly matches the detected emotional tone, and naturally
-weave in relevant emojis throughout the text.
+The user recorded a voice message. Your job is to make MINIMAL edits to the
+transcribed text so it clearly communicates the same message while also
+reflecting the emotional tone. You must NOT rewrite or restructure the sentence.
 
-Transcribed message:
+Transcribed message (keep this mostly intact):
 "{transcribed_text}"
 
 Detected emotional tone: {detected_tone}
-Tone emojis to use: {emojis}
+Tone emojis to sprinkle in: {emojis}
 
-Rephrasing rules based on tone:
-- angry   : Use ALL CAPS for emphasis, short punchy sentences, include 😡🔥💢
-- happy   : Warm, enthusiastic language, exclamation points, include 😊🎉✨
-- neutral : Clear, professional tone, measured language, include 😐💬🙂
-- sad     : Soft, empathetic words, ellipses for pauses, include 😢💧🥺
-- excited : Energetic, fast-paced, lots of emphasis, include 🤩🚀⚡
-
-Output ONLY the rephrased message — no explanations, no preamble.
+Your rules:
+1. Preserve the original words as much as possible (aim for 80-90% same).
+2. Only adjust: emphasis (CAPS for key words), punctuation, a word swap here
+   or there, and 1-3 tone-appropriate emojis placed naturally in the text.
+3. Do NOT change the meaning, add new ideas, or rewrite full sentences.
+4. Tone-specific touches (keep them subtle):
+   - angry   : Capitalise the most important word(s). Maybe end with "!" Add 😡 or 🔥 once.
+   - happy   : Add a "!" or "😊". Maybe swap one word for a warmer synonym.
+   - neutral : Light clean-up only. One 💬 or 🙂 at most.
+   - sad     : Soften one word slightly. Add "..." for a pause. Add 😢 once.
+   - excited : Add a "!" or "!!", emphasise one word. Add 🤩 or ⚡ once.
+5. Output ONLY the lightly enhanced message — no labels, no explanation.
 """.strip()
 
 
-def build_vibesync_chain():
+def build_vibesync_chain(temperature: float = 0.8):
     """
-    Constructs and returns the LCEL chain.
+    Constructs and returns the LCEL chain plus the active LLM name.
 
     Chain anatomy:
       prompt_template  →  llm  →  output_parser
           Runnable         Runnable      Runnable
-    The pipe operator (|) wires them together.  When .invoke() is called,
+    The pipe operator (|) wires them together. When .invoke() is called,
     execution flows left-to-right automatically.
 
     Returns:
-        A compiled LCEL Runnable that accepts:
-            {"transcribed_text": str, "detected_tone": str, "emojis": str}
-        and returns:
-            str  (the rephrased message)
+        Tuple[chain, llm_name]:
+          chain    — LCEL Runnable that accepts the input dict and returns str
+          llm_name — human-readable name of the selected LLM (for UI display)
     """
     # Step 1 – PromptTemplate
-    # input_variables tells LangChain which keys to expect in the dict
-    # passed to .invoke()
+    # input_variables tells LangChain which keys to expect in .invoke()
     prompt = PromptTemplate(
         input_variables=["transcribed_text", "detected_tone", "emojis"],
         template=VIBESYNC_PROMPT_TEMPLATE,
     )
 
-    # Step 2 – LLM  (gemini-2.5-flash via langchain-google-genai)
-    # temperature=0.8 adds creativity while keeping responses coherent
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=0.8,
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-    )
+    # Step 2 – LLM  (Gemini primary, Groq fallback)
+    llm, llm_name = get_llm(temperature=temperature)
 
     # Step 3 – Output parser
-    # StrOutputParser.invoke() calls output.content on the AIMessage
-    # returned by the LLM, giving us a plain Python string.
+    # StrOutputParser extracts the plain string from the AIMessage returned
+    # by any BaseChatModel — works identically for Gemini and Groq.
     output_parser = StrOutputParser()
 
-    # Wire the chain with LCEL's pipe operator
-    #   dict input → prompt renders it → LLM generates → parser extracts text
+    # Wire the chain with LCEL's pipe operator:
+    #   dict → PromptTemplate renders it → LLM generates → parser extracts text
     chain = prompt | llm | output_parser
 
-    return chain
+    return chain, llm_name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  PUBLIC ENTRY POINT
+# 4.  PUBLIC ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def rephrase_with_vibe(transcribed_text: str, detected_tone: str) -> str:
+def rephrase_with_vibe(transcribed_text: str, detected_tone: str) -> tuple[str, str]:
     """
     Main entry-point called by app.py.
 
-    Resolves the emoji palette for the detected tone, builds the LCEL chain,
-    invokes it, and returns the final rephrased string.
+    Resolves the emoji palette for the detected tone, builds the LCEL chain
+    (with automatic Gemini → Groq fallback), invokes it, and returns the
+    rephrased string together with the name of the LLM that was used.
 
     Args:
         transcribed_text: Raw transcript from Whisper.
         detected_tone:    Tone label (e.g. "angry", "happy", ...).
 
     Returns:
-        Rephrased message string from Gemini.
+        Tuple[str, str]: (rephrased_message, llm_name_used)
     """
     emojis = TONE_EMOJI_MAP.get(detected_tone, "💬")
 
-    # Build a fresh chain for each call (stateless; no memory needed in MVP)
-    chain = build_vibesync_chain()
+    # Build a fresh chain for each call (stateless; no memory needed in MVP).
+    # llm_name is returned so the UI can display which LLM was used.
+    chain, llm_name = build_vibesync_chain()
 
     # .invoke() kicks off the pipeline:
     #   1. PromptTemplate fills {transcribed_text}, {detected_tone}, {emojis}
-    #   2. ChatGoogleGenerativeAI sends the rendered prompt to Gemini API
-    #   3. StrOutputParser returns the plain text response
+    #   2. LLM (Gemini or Groq) sends the rendered prompt and gets a response
+    #   3. StrOutputParser returns the plain text
     result: str = chain.invoke(
         {
             "transcribed_text": transcribed_text,
@@ -186,4 +250,4 @@ def rephrase_with_vibe(transcribed_text: str, detected_tone: str) -> str:
         }
     )
 
-    return result
+    return result, llm_name

@@ -239,30 +239,75 @@ st.markdown(
 )
 
 # ── API Key check ─────────────────────────────────────────────────────────────
-api_key = os.getenv("GOOGLE_API_KEY", "")
-if not api_key or api_key == "your_google_api_key_here":
-    st.warning(
-        "⚠️  **Google API Key not found.** Create a `.env` file with `GOOGLE_API_KEY=your_key` "
-        "and restart the app. Get a free key at [aistudio.google.com](https://aistudio.google.com).",
-        icon="🔑",
+google_key = os.getenv("GOOGLE_API_KEY", "").strip()
+groq_key   = os.getenv("GROQ_API_KEY",   "").strip()
+_no_google = not google_key or google_key == "your_google_api_key_here"
+_no_groq   = not groq_key   or groq_key   == "your_groq_api_key_here"
+
+if _no_google and _no_groq:
+    st.error(
+        "🔑  **No LLM API key found.** Add at least one of these to your `.env` file:\n"
+        "- `GOOGLE_API_KEY` — [Get Gemini key](https://aistudio.google.com)\n"
+        "- `GROQ_API_KEY`   — [Get Groq key](https://console.groq.com)",
+        icon="🚨",
+    )
+elif _no_google:
+    st.info(
+        "ℹ️  Gemini key not found — **Groq (llama-3.1-8b-instant)** will be used as the LLM.",
+        icon="🤖",
     )
 
-# ── Step 1: Audio Upload ───────────────────────────────────────────────────────
+# ── Step 1: Audio Input (Record or Upload) ────────────────────────────────────
 st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-st.markdown('<p class="section-label">Step 1 — Upload Your Voice Note</p>', unsafe_allow_html=True)
-st.markdown(
-    "Upload a **.wav** or **.mp3** file of your voice message. "
-    "Whisper will transcribe it locally — your audio never leaves your machine.",
-)
+st.markdown('<p class="section-label">Step 1 — Give Us Your Voice</p>', unsafe_allow_html=True)
 
-uploaded_file = st.file_uploader(
-    "Choose an audio file",
-    type=["wav", "mp3", "m4a", "ogg", "flac"],
-    label_visibility="collapsed",
-)
+from audio_recorder_streamlit import audio_recorder
 
-if uploaded_file:
-    st.audio(uploaded_file, format=f"audio/{uploaded_file.name.split('.')[-1]}")
+tab_record, tab_upload = st.tabs(["🎙️  Record Now", "📁  Upload File"])
+
+audio_bytes: bytes | None = None
+audio_suffix: str = ".wav"
+
+with tab_record:
+    st.markdown(
+        "<p style='color:#94a3b8; font-size:0.9rem; margin-bottom:0.8rem;'>"
+        "Click the mic button to start recording. Click again to stop. "
+        "Whisper runs locally — your audio never leaves your device."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+    # audio_recorder returns raw WAV bytes after recording, or None
+    recorded_bytes = audio_recorder(
+        text="",
+        recording_color="#ef4444",
+        neutral_color="#a78bfa",
+        icon_name="microphone",
+        icon_size="3x",
+        pause_threshold=3.0,   # auto-stop after 3 s of silence
+        sample_rate=16_000,    # Whisper prefers 16 kHz
+    )
+    if recorded_bytes:
+        audio_bytes  = recorded_bytes
+        audio_suffix = ".wav"
+        st.audio(recorded_bytes, format="audio/wav")
+        st.success("✅  Recording captured! Hit \"Analyze & Rephrase\" below.")
+
+with tab_upload:
+    st.markdown(
+        "<p style='color:#94a3b8; font-size:0.9rem; margin-bottom:0.8rem;'>"
+        "Upload a .wav, .mp3, .m4a, .ogg or .flac voice note."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+    uploaded_file = st.file_uploader(
+        "Choose an audio file",
+        type=["wav", "mp3", "m4a", "ogg", "flac"],
+        label_visibility="collapsed",
+    )
+    if uploaded_file:
+        audio_bytes  = uploaded_file.read()
+        audio_suffix = "." + uploaded_file.name.split(".")[-1]
+        st.audio(audio_bytes, format=f"audio/{audio_suffix.lstrip('.')}")
 
 st.markdown("</div>", unsafe_allow_html=True)
 
@@ -270,19 +315,19 @@ st.markdown("</div>", unsafe_allow_html=True)
 st.markdown('<div class="glass-card">', unsafe_allow_html=True)
 st.markdown('<p class="section-label">Step 2 — Sync Your Vibe</p>', unsafe_allow_html=True)
 
-process_btn = st.button("🚀  Analyze & Rephrase", disabled=(uploaded_file is None))
+process_btn = st.button("🚀  Analyze & Rephrase", disabled=(audio_bytes is None))
 
 st.markdown("</div>", unsafe_allow_html=True)
 
 # ── Processing logic ───────────────────────────────────────────────────────────
-if process_btn and uploaded_file:
+if process_btn and audio_bytes:
 
     from pipeline import mock_tone_analysis, rephrase_with_vibe
 
     # ─── Transcription ────────────────────────────────────────────────────────
     with st.spinner("🎙️  Transcribing audio with Whisper…"):
-        suffix = "." + uploaded_file.name.split(".")[-1]
-        transcript = transcribe_audio(uploaded_file.read(), suffix=suffix)
+        transcript = transcribe_audio(audio_bytes, suffix=audio_suffix)
+
 
     if not transcript:
         st.error("❌ Whisper couldn't extract any speech. Try a clearer audio file.")
@@ -293,9 +338,9 @@ if process_btn and uploaded_file:
         time.sleep(0.6)  # small artificial delay so the spinner is visible
         detected_tone = mock_tone_analysis(audio_path=None)
 
-    # ─── LangChain LCEL pipeline ──────────────────────────────────────────────
-    with st.spinner("✨  VibeSync is rephrasing with Gemini…"):
-        rephrased = rephrase_with_vibe(transcript, detected_tone)
+    # ─── LangChain LCEL pipeline (Gemini primary → Groq fallback) ──────────────
+    with st.spinner("✨  VibeSync is rephrasing your message…"):
+        rephrased, llm_name = rephrase_with_vibe(transcript, detected_tone)
 
     tone_info = TONE_META.get(detected_tone, TONE_META["neutral"])
 
@@ -325,11 +370,12 @@ if process_btn and uploaded_file:
 
     # Rephrased output card
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-    st.markdown('<p class="section-label">🪄 VibeSync Output — Rephrased Message</p>', unsafe_allow_html=True)
+    st.markdown('<p class="section-label">🪄 VibeSync Output — Tone-Enhanced Message</p>', unsafe_allow_html=True)
     st.markdown(f'<div class="output-box">{rephrased}</div>', unsafe_allow_html=True)
     st.markdown(
-        "<br><small style='color:#64748b; font-size:0.78rem;'>"
-        "Generated by Gemini 2.5 Flash via LangChain LCEL pipeline</small>",
+        f"<br><small style='color:#64748b; font-size:0.78rem;'>"
+        f"Generated by <strong style='color:#a78bfa'>{llm_name}</strong> "
+        f"via LangChain LCEL pipeline</small>",
         unsafe_allow_html=True,
     )
     st.markdown("</div>", unsafe_allow_html=True)
@@ -339,6 +385,6 @@ if process_btn and uploaded_file:
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown(
-    '<p class="footer">VibeSync MVP · Powered by Whisper · LangChain · Gemini 2.5 Flash</p>',
+    '<p class="footer">VibeSync MVP · Powered by Whisper · LangChain · Gemini 2.5 Flash + Groq Fallback</p>',
     unsafe_allow_html=True,
 )

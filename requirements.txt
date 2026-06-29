@@ -2,8 +2,10 @@ streamlit>=1.35.0
 openai-whisper
 langchain-core>=0.2.0
 langchain-google-genai>=1.0.0
+langchain-groq>=0.1.0
 google-generativeai>=0.7.0
 python-dotenv>=1.0.0
+audio-recorder-streamlit>=0.0.8
 numpy
 torch
 torchaudio
