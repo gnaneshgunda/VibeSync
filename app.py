@@ -22,9 +22,13 @@ load_dotenv()  # works locally; no-op on Streamlit Cloud (no .env file)
 # On Streamlit Cloud, secrets live in st.secrets (set via the dashboard).
 # We mirror them into os.environ so pipeline.py can read them with os.getenv()
 # regardless of whether the app is running locally or in the cloud.
-for _key in ("GOOGLE_API_KEY", "GROQ_API_KEY"):
-    if _key in st.secrets and not os.environ.get(_key):
-        os.environ[_key] = st.secrets[_key]
+# Locally (no secrets.toml), this block is silently skipped — .env values are used.
+try:
+    for _key in ("GOOGLE_API_KEY", "GROQ_API_KEY"):
+        if _key in st.secrets and not os.environ.get(_key):
+            os.environ[_key] = st.secrets[_key]
+except Exception:
+    pass  # No secrets.toml present — running locally, .env values are used instead
 
 
 # ── Page config (must be first Streamlit call) ────────────────────────────────
@@ -199,7 +203,7 @@ st.markdown(
 def load_whisper_model():
     """Load and cache the Whisper model (runs once per session)."""
     import whisper
-    return whisper.load_model("base")   # "base" is fast; swap to "small" for accuracy
+    return whisper.load_model("small")  # "small" is ~3x more accurate than "base"
 
 
 def transcribe_audio(audio_bytes: bytes, suffix: str = ".wav") -> str:
