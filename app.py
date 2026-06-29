@@ -196,19 +196,14 @@ st.markdown(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: lazy-load heavy dependencies so Streamlit starts fast
+# Transcription via Groq Whisper API (whisper-large-v3-turbo)
+# No local model loaded → zero RAM cost on Streamlit Cloud free tier.
+# Quality: Whisper large-v3-turbo >> local "small" model.
 # ─────────────────────────────────────────────────────────────────────────────
-
-@st.cache_resource(show_spinner=False)
-def load_whisper_model():
-    """Load and cache the Whisper model (runs once per session)."""
-    import whisper
-    return whisper.load_model("small")  # "small" is ~3x more accurate than "base"
-
 
 def transcribe_audio(audio_bytes: bytes, suffix: str = ".wav") -> str:
     """
-    Write audio bytes to a temp file, run Whisper, return transcript.
+    Send audio bytes to Groq's Whisper large-v3-turbo API and return transcript.
 
     Args:
         audio_bytes: Raw audio file content.
@@ -217,15 +212,26 @@ def transcribe_audio(audio_bytes: bytes, suffix: str = ".wav") -> str:
     Returns:
         Transcribed text string.
     """
-    model = load_whisper_model()
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
-    try:
-        result = model.transcribe(tmp_path, fp16=False)
-        return result["text"].strip()
-    finally:
-        os.unlink(tmp_path)
+    from groq import Groq
+
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not groq_key or groq_key == "your_groq_api_key_here":
+        raise ValueError("GROQ_API_KEY is required for transcription.")
+
+    client = Groq(api_key=groq_key)
+
+    # Groq SDK needs a file-like object with a name attribute
+    import io
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = f"audio{suffix}"
+
+    transcription = client.audio.transcriptions.create(
+        file=audio_file,
+        model="whisper-large-v3-turbo",   # fastest large-quality Whisper on Groq
+        response_format="text",
+        language="en",
+    )
+    return transcription.strip() if isinstance(transcription, str) else transcription.text.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
