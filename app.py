@@ -16,7 +16,16 @@ import tempfile
 import streamlit as st
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv()  # works locally; no-op on Streamlit Cloud (no .env file)
+
+# ── Streamlit Cloud secrets bridge ────────────────────────────────────────────
+# On Streamlit Cloud, secrets live in st.secrets (set via the dashboard).
+# We mirror them into os.environ so pipeline.py can read them with os.getenv()
+# regardless of whether the app is running locally or in the cloud.
+for _key in ("GOOGLE_API_KEY", "GROQ_API_KEY"):
+    if _key in st.secrets and not os.environ.get(_key):
+        os.environ[_key] = st.secrets[_key]
+
 
 # ── Page config (must be first Streamlit call) ────────────────────────────────
 st.set_page_config(
